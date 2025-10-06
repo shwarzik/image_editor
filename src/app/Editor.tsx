@@ -102,6 +102,16 @@ export default function Editor() {
   const [hoverRotate, setHoverRotate] = useState(false);
   useApplyKonvaFilters(imageRef, filters, imgSize ?? null);
 
+  // Touch/coarse pointer detection to tune UX on mobile
+  const isCoarsePointer = useMemo(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
+    try {
+      return window.matchMedia('(pointer: coarse)').matches;
+    } catch {
+      return false;
+    }
+  }, []);
+
   // Backfill baseSize for existing strokes so they scale with future resizes
   useEffect(() => {
     if (!imgSize || !strokes || strokes.length === 0) return;
@@ -119,6 +129,63 @@ export default function Editor() {
       setShowCropUI(!!storeCrop);
     }
   }, [tool, storeCrop, setShowCropUI]);
+
+  // Recompute Stage size on mount and window resize; ensure default canvas fits viewport
+  useEffect(() => {
+    const BASE_W = 500;
+    const BASE_H = 500;
+    const compute = () => {
+      const el = containerRef.current;
+      const mount = stageMountRef.current;
+      if (!el || !mount) return;
+      const rect = el.getBoundingClientRect();
+      const mrect = mount.getBoundingClientRect();
+      const availW = Math.max(1, Math.floor(rect.width));
+      const availH = Math.max(1, Math.floor(window.innerHeight - mrect.top - 16));
+      if (!image) {
+        // Fit a square-ish default canvas within viewport
+        const scale = Math.min(availW / BASE_W, availH / BASE_H, 1);
+        const w = Math.max(1, Math.round(BASE_W * scale));
+        const h = Math.max(1, Math.round(BASE_H * scale));
+        setViewSize({ w, h });
+      } else {
+        // With image loaded, refit to width (fallback to height) and update canvas and image sizes.
+        const iw = (image as HTMLImageElement).naturalWidth || 1;
+        const ih = (image as HTMLImageElement).naturalHeight || 1;
+        const scaleW = Math.min(availW / iw, 1);
+        let wFit = Math.round(iw * scaleW);
+        let hFit = Math.round(ih * scaleW);
+        let finalW = Math.min(availW, wFit);
+        let scale2 = finalW / iw;
+        let finalH = Math.round(ih * scale2);
+        if (finalH > availH) {
+          scale2 = Math.min(availW / iw, availH / ih, 1);
+          finalW = Math.round(iw * scale2);
+          finalH = Math.round(ih * scale2);
+        }
+        setViewSize({ w: finalW, h: finalH });
+        setImgSize({ w: finalW, h: finalH });
+        setOffset({ x: 0, y: 0 });
+        setBothCrop({ x: 0, y: 0, w: finalW, h: finalH });
+      }
+    };
+    // initial compute and listeners
+    compute();
+    const onResize = () => compute();
+    window.addEventListener('resize', onResize);
+    let ro: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined' && containerRef.current) {
+      ro = new ResizeObserver(() => compute());
+      ro.observe(containerRef.current);
+    }
+    return () => {
+      window.removeEventListener('resize', onResize);
+      if (ro && containerRef.current) {
+        try { ro.unobserve(containerRef.current); } catch {}
+        try { ro.disconnect(); } catch {}
+      }
+    };
+  }, [image, setViewSize]);
 
   // geometry helpers moved to utils
   const getCenter = () => ({ x: offset.x + (imgSize?.w ?? 0) / 2, y: offset.y + (imgSize?.h ?? 0) / 2 });
@@ -139,6 +206,10 @@ export default function Editor() {
     return { x: clamp(x, b.left, b.right), y: clamp(y, b.top, b.bottom) };
   };
   const onMouseDown = (e: any) => {
+    // Prevent page scroll/zoom on touch during interactions
+    if (e?.evt && 'touches' in e.evt && typeof e.evt.preventDefault === 'function') {
+      if (e.evt.cancelable) e.evt.preventDefault();
+    }
     // Only react to left mouse button
     if (e?.evt && typeof e.evt.button === 'number' && e.evt.button !== 0) return;
     const pos = e.target.getStage().getPointerPosition();
@@ -204,6 +275,8 @@ export default function Editor() {
 
     // If we already have a crop, decide visibility & handle hit
     if (crop) {
+      const HANDLE_RADIUS = isCoarsePointer ? Math.max(24, HANDLE_HIT_RADIUS) : HANDLE_HIT_RADIUS;
+      const ROTATE_RADIUS = isCoarsePointer ? Math.max(28, ROTATE_HIT_RADIUS) : ROTATE_HIT_RADIUS;
       // rotation handle detection in pan mode should happen BEFORE insideCrop check,
       // because the handle is outside the crop box
       if (tool === 'pan') {
@@ -213,7 +286,7 @@ export default function Editor() {
         const rpos = rotateAround(baseRx, baseRy, cx, cy, rotation);
         const dxr = pos.x - rpos.x;
         const dyr = pos.y - rpos.y;
-        if (dxr * dxr + dyr * dyr <= ROTATE_HIT_RADIUS * ROTATE_HIT_RADIUS) {
+        if (dxr * dxr + dyr * dyr <= ROTATE_RADIUS * ROTATE_RADIUS) {
           const cx0 = crop.x + crop.w / 2;
           const cy0 = crop.y + crop.h / 2;
           const angle = Math.atan2(pos.y - cy0, pos.x - cx0) * 180 / Math.PI;
@@ -241,7 +314,7 @@ export default function Editor() {
         for (const h of handles) {
           const dx = pos.x - h.x;
           const dy = pos.y - h.y;
-          if (dx * dx + dy * dy <= HANDLE_HIT_RADIUS * HANDLE_HIT_RADIUS) {
+          if (dx * dx + dy * dy <= HANDLE_RADIUS * HANDLE_RADIUS) {
             setDragHandle(h.name);
             const { x: cx3, y: cy3 } = getCenter();
             resizeRef.current = { x: cx3, y: cy3 };
@@ -289,7 +362,8 @@ export default function Editor() {
         for (const h of baseHandles) {
           const dx = pos.x - h.x;
           const dy = pos.y - h.y;
-          if (dx * dx + dy * dy <= HANDLE_HIT_RADIUS * HANDLE_HIT_RADIUS) {
+          const HANDLE_RADIUS2 = isCoarsePointer ? Math.max(24, HANDLE_HIT_RADIUS) : HANDLE_HIT_RADIUS;
+          if (dx * dx + dy * dy <= HANDLE_RADIUS2 * HANDLE_RADIUS2) {
             setDragHandle(h.name);
             const { x: cx3, y: cy3 } = getCenter();
             resizeRef.current = { x: cx3, y: cy3 };
@@ -309,6 +383,10 @@ export default function Editor() {
   };
 
   const onMouseMove = (e: any) => {
+    // Prevent page scroll while dragging on touch
+    if (e?.evt && 'touches' in e.evt && typeof e.evt.preventDefault === 'function') {
+      if (e.evt.cancelable) e.evt.preventDefault();
+    }
     // Always update cursor position for preview
     const pos = e.target.getStage().getPointerPosition();
     if (pos) setCursorPos(pos);
@@ -337,10 +415,11 @@ export default function Editor() {
           { name: 'w', x: crop.x, y: crop.y + crop.h / 2 },
           { name: 'e', x: crop.x + crop.w, y: crop.y + crop.h / 2 },
         ];
+        const handleHoverRadius = isCoarsePointer ? 24 : 16;
         for (const h of handles) {
           const dx = px - h.x;
           const dy = py - h.y;
-          if (dx * dx + dy * dy <= 16 * 16) { // HANDLE_HIT_RADIUS
+          if (dx * dx + dy * dy <= handleHoverRadius * handleHoverRadius) { // HANDLE_HIT_RADIUS
             overHandle = h.name;
             break;
           }
@@ -353,7 +432,8 @@ export default function Editor() {
           const rpos = rotateAround(rx, ry, cx, cy, rotation);
           const dxr = pos.x - rpos.x;
           const dyr = pos.y - rpos.y;
-          if (dxr * dxr + dyr * dyr <= 18 * 18) { // ROTATE_HIT_RADIUS
+          const rotateHoverRadius = isCoarsePointer ? 28 : 18;
+          if (dxr * dxr + dyr * dyr <= rotateHoverRadius * rotateHoverRadius) { // ROTATE_HIT_RADIUS
             overRotate = true;
           }
         }
@@ -547,15 +627,15 @@ export default function Editor() {
         // Set view size so Stage uses these dimensions from now on
         setViewSize({ w: availW, h: availH });
       }
-      // Fit image within viewport; then enforce minimum canvas width 500 without violating viewport
-      const scaleFit = Math.min(availW / nw, availH / nh, 1);
-      let wFit = Math.round(nw * scaleFit);
-      let hFit = Math.round(nh * scaleFit);
-      // Try to enforce min width 500, limited by container width
-      let finalW = Math.min(availW, Math.max(500, wFit));
+  // Fit image to container WIDTH (viewport width on mobile). Do not shrink further due to height.
+  const scaleFitW = Math.min(availW / nw, 1);
+  let wFit = Math.round(nw * scaleFitW);
+  let hFit = Math.round(nh * scaleFitW);
+      // Final size constrained by container; prefer width fit
+      let finalW = Math.min(availW, wFit);
       let scale2 = finalW / nw;
       let finalH = Math.round(nh * scale2);
-      // If enforcing 500 would exceed available height, fall back to height-constrained fit
+      // If width-fit height exceeds available height, fall back to height fit
       if (finalH > availH) {
         scale2 = Math.min(availW / nw, availH / nh, 1);
         finalW = Math.round(nw * scale2);
@@ -625,7 +705,7 @@ export default function Editor() {
   const [activeTab, setActiveTab] = useState<'background' | 'edit'>('edit');
 
   return (
-    <div className="max-w-[1200px] mx-auto p-4">
+    <div className="max-w-[1200px] mx-auto px-0 md:px-4 py-4">
       <div className="flex items-center justify-between mb-3">
         <div className="flex justify-center gap-2">
           <input
@@ -647,15 +727,20 @@ export default function Editor() {
         </div>
       </div>
 
-      <div className="flex justify-center w-fit gap-4 p-8 mx-auto bg-slate-50 border border-slate-200 rounded-md">
+  <div className="flex flex-col md:flex-row w-full gap-4 p-2 md:p-8 mx-auto bg-slate-50 border border-slate-200 rounded-md">
         {/* Left: Canvas area */}
-        <div ref={containerRef} className="min-w-[400px]">
+        <div ref={containerRef} className="flex-1 w-full">
           <div ref={stageMountRef} />
+          <div className="w-full flex justify-center px-2 md:px-0 py-2">
           <Stage ref={stageRef} width={STAGE_W} height={STAGE_H}
             onMouseDown={onMouseDown} onMouseMove={onMouseMove} onMouseUp={onMouseUp}
+            onTouchStart={onMouseDown} onTouchMove={onMouseMove} onTouchEnd={onMouseUp}
+            onTouchCancel={() => { setCursorPos(null); setHoverHandle(null); setHoverRotate(false); }}
             onMouseLeave={() => { setCursorPos(null); setHoverHandle(null); setHoverRotate(false); }}
             className="border border-slate-200 bg-white"
             style={{
+              touchAction: 'none',
+              display: 'block',
               cursor: (() => {
                 if (tool === 'pan' && (dragHandle || isRotating)) return 'grabbing';
                 if (tool === 'pan' && hoverRotate) return 'grab';
@@ -736,9 +821,10 @@ export default function Editor() {
               <CropOverlay tool={tool as any} imgSize={imgSize ?? null} offset={offset} crop={crop} rotation={rotation} isRotating={isRotating} />
             )}
           </Stage>
+          </div>
         </div>
         {/* Right: Sidebar with tabs */}
-        <aside className="w-80 shrink-0">
+  <aside className="w-full md:w-80 shrink-0">
           {/* Tabs header */}
           <div className="flex rounded-md overflow-hidden border border-slate-200 mb-3">
             <button
