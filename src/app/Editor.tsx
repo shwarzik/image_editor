@@ -100,7 +100,19 @@ export default function Editor() {
   // Track which handle (if any) the mouse is over for cursor feedback
   const [hoverHandle, setHoverHandle] = useState<string | null>(null);
   const [hoverRotate, setHoverRotate] = useState(false);
+  // Mobile tools menu
+  const [mobileToolsOpen, setMobileToolsOpen] = useState(false);
   useApplyKonvaFilters(imageRef, filters, imgSize ?? null);
+  // Track image presence and retain latest image element for resize logic without re-creating effects
+  const hasImageRef = useRef(false);
+  const imageElRef = useRef<HTMLImageElement | null>(null);
+  useEffect(() => {
+    hasImageRef.current = !!image;
+    imageElRef.current = (image as HTMLImageElement) ?? null;
+  }, [image]);
+  // Lock stage view size across crop apply to avoid canvas jumping when switching tools
+  const lockViewRef = useRef(false);
+  const lockedViewSizeRef = useRef<{ w: number; h: number } | null>(null);
 
   // Touch/coarse pointer detection to tune UX on mobile
   const isCoarsePointer = useMemo(() => {
@@ -134,7 +146,10 @@ export default function Editor() {
   useEffect(() => {
     const BASE_W = 500;
     const BASE_H = 500;
+    const prevWinWidthRef = { current: typeof window !== 'undefined' ? window.innerWidth : 0 } as { current: number };
     const compute = () => {
+      // If we're temporarily locking the view (e.g., right after crop), do not recompute
+      if (hasImageRef.current && lockViewRef.current) return;
       const el = containerRef.current;
       const mount = stageMountRef.current;
       if (!el || !mount) return;
@@ -142,7 +157,7 @@ export default function Editor() {
       const mrect = mount.getBoundingClientRect();
       const availW = Math.max(1, Math.floor(rect.width));
       const availH = Math.max(1, Math.floor(window.innerHeight - mrect.top - 16));
-      if (!image) {
+      if (!hasImageRef.current) {
         // Fit a square-ish default canvas within viewport
         const scale = Math.min(availW / BASE_W, availH / BASE_H, 1);
         const w = Math.max(1, Math.round(BASE_W * scale));
@@ -150,8 +165,10 @@ export default function Editor() {
         setViewSize({ w, h });
       } else {
         // With image loaded, refit to width (fallback to height) and update canvas and image sizes.
-        const iw = (image as HTMLImageElement).naturalWidth || 1;
-        const ih = (image as HTMLImageElement).naturalHeight || 1;
+        const imgEl = imageElRef.current;
+        if (!imgEl) return;
+        const iw = imgEl.naturalWidth || 1;
+        const ih = imgEl.naturalHeight || 1;
         const scaleW = Math.min(availW / iw, 1);
         let wFit = Math.round(iw * scaleW);
         let hFit = Math.round(ih * scaleW);
@@ -171,7 +188,18 @@ export default function Editor() {
     };
     // initial compute and listeners
     compute();
-    const onResize = () => compute();
+    const onResize = () => {
+      // On mobile, scrolling changes visual viewport height and fires resize.
+      // After an image is loaded, keep canvas size stable during scroll by only
+      // reacting to width changes (orientation change/layout) and ignoring pure height changes.
+      if (lockViewRef.current) return; // ignore all resizes while locked
+      const curW = typeof window !== 'undefined' ? window.innerWidth : prevWinWidthRef.current;
+      if (hasImageRef.current) {
+        if (Math.abs(curW - prevWinWidthRef.current) < 1) return; // ignore height-only changes
+      }
+      prevWinWidthRef.current = curW;
+      compute();
+    };
     window.addEventListener('resize', onResize);
     let ro: ResizeObserver | null = null;
     if (typeof ResizeObserver !== 'undefined' && containerRef.current) {
@@ -185,7 +213,7 @@ export default function Editor() {
         try { ro.disconnect(); } catch {}
       }
     };
-  }, [image, setViewSize]);
+  }, []);
 
   // geometry helpers moved to utils
   const getCenter = () => ({ x: offset.x + (imgSize?.w ?? 0) / 2, y: offset.y + (imgSize?.h ?? 0) / 2 });
@@ -595,6 +623,10 @@ export default function Editor() {
       setOffset({ x: px, y: py });
       setImgSize({ w: pw, h: ph });
       setBothCrop({ x: px, y: py, w: pw, h: ph });
+      // Restore previous view size while we were locked
+      if (lockedViewSizeRef.current) {
+        setViewSize({ w: lockedViewSizeRef.current.w, h: lockedViewSizeRef.current.h });
+      }
       setShowCropUI(true);
       // mark current src as sized to avoid later refit
       lastSizedSrcRef.current = src ?? null;
@@ -604,6 +636,9 @@ export default function Editor() {
         pushSnapshot({ src, offset: { x: px, y: py }, imgSize: { w: pw, h: ph }, crop: { x: px, y: py, w: pw, h: ph }, rotation, filters, strokes });
         lastPushedSrcRef.current = src ?? null;
       }
+      // Release view lock now that baseline snapshot is pushed/synced
+      lockViewRef.current = false;
+      lockedViewSizeRef.current = null;
       return;
     }
     // legacy bake path removed
@@ -692,6 +727,9 @@ export default function Editor() {
     skipFitForNextSrcRef.current = true;
     // Preserve placement so new bitmap appears where the crop was
     pendingCropPlacementRef.current = { x: Math.round(x), y: Math.round(y), w: outW, h: outH };
+    // Lock view size so switching tools right after crop does not change canvas size
+    lockViewRef.current = true;
+    lockedViewSizeRef.current = { w: STAGE_W, h: STAGE_H };
     setSrc(url);
     setBothCrop(null);
   };
@@ -729,7 +767,67 @@ export default function Editor() {
 
   <div className="flex flex-col md:flex-row w-full gap-4 p-2 md:p-8 mx-auto bg-slate-50 border border-slate-200 rounded-md">
         {/* Left: Canvas area */}
-        <div ref={containerRef} className="flex-1 w-full">
+        <div ref={containerRef} className="flex-1 w-full relative">
+          {/* Mobile Tools button */}
+          <div className="md:hidden flex justify-end mb-2 px-2">
+            <Button variant="outline" onClick={() => setMobileToolsOpen(v => !v)}>Tools</Button>
+          </div>
+          {/* Mobile contextual toolbar overlay */}
+          {mobileToolsOpen && (
+            <>
+              <div className="fixed inset-0 z-40" onClick={() => setMobileToolsOpen(false)} />
+              <div className="absolute z-50 left-2 right-2 top-12 md:hidden">
+                <div className="rounded-md border border-slate-200 shadow-lg bg-white p-3 max-h-[70vh] overflow-auto">
+                  <Toolbar
+                    tool={tool}
+                    setTool={(next) => {
+                      if (next === tool) return;
+                      if (!image && next === 'image-eraser') return;
+                      if (tool === 'crop') {
+                        const cur = crop ? normCrop(crop) : null;
+                        const prev = previousCropRef.current;
+                        const eq = !!cur && !!prev && cur.x === prev.x && cur.y === prev.y && cur.w === prev.w && cur.h === prev.h;
+                        if (crop && !eq) {
+                          applyCrop();
+                        }
+                      }
+                      setTool(next);
+                      if (next === 'crop') {
+                        if (imgSize) {
+                          const full = { x: offset.x, y: offset.y, w: imgSize.w, h: imgSize.h };
+                          setBothCrop(full);
+                          setShowCropUI(true);
+                          previousCropRef.current = { ...full };
+                        }
+                      } else if (next === 'pan') {
+                        previousCropRef.current = null;
+                      }
+                    }}
+                    onResetCrop={() => {
+                      const next = imgSize ? { x: offset.x, y: offset.y, w: imgSize.w, h: imgSize.h } : null;
+                      setBothCrop(next);
+                      pushSnapshot({ src, offset, imgSize: imgSize ?? null, crop: next, rotation, filters, strokes });
+                    }}
+                    hasImage={!!image}
+                    onUndo={() => { isRestoringRef.current = true; undo(); setTimeout(() => { isRestoringRef.current = false; }, 0); }}
+                    onRedo={() => { isRestoringRef.current = true; redo(); setTimeout(() => { isRestoringRef.current = false; }, 0); }}
+                    canUndo={canUndo}
+                    canRedo={canRedo}
+                    filters={filters}
+                    setFilters={(f: any) => setFilters(typeof f === 'function' ? f(filters) : f)}
+                    brushColor={brushColor}
+                    brushSize={brushSize}
+                    eraserSize={eraserSize}
+                    imageEraserSize={imageEraserSize}
+                    setImageEraserSize={setImageEraserSize}
+                    setBrushColor={setBrushColor}
+                    setBrushSize={setBrushSize}
+                    setEraserSize={setEraserSize}
+                  />
+                </div>
+              </div>
+            </>
+          )}
           <div ref={stageMountRef} />
           <div className="w-full flex justify-center px-2 md:px-0 py-2">
           <Stage ref={stageRef} width={STAGE_W} height={STAGE_H}
@@ -824,7 +922,7 @@ export default function Editor() {
           </div>
         </div>
         {/* Right: Sidebar with tabs */}
-  <aside className="w-full md:w-80 shrink-0">
+  <aside className="hidden md:block w-full md:w-80 shrink-0">
           {/* Tabs header */}
           <div className="flex rounded-md overflow-hidden border border-slate-200 mb-3">
             <button
